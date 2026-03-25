@@ -1,0 +1,7 @@
+# Ignore the actual inventory and certificates
+hdd_inventory_log.csv
+certificates/
+
+# Ignore Python cache
+__pycache__/
+*.py[cod]
