@@ -26,7 +26,6 @@ def initialize_system():
     """Checks for CSV existence and announces status to user."""
     headers = ["Date", "Serial", "Model", "Capacity", "Hours", "Bad_Sectors", "SMART_Status", "Grade", "Wipe_Result", "Certificate_File"]
     
-    # Corrected Centered Panel for initialize_system
     audit_panel = Panel(
         Align.center("[bold yellow]SYSTEM AUDIT IN PROGRESS...[/bold yellow]"),
         border_style="yellow"
@@ -84,21 +83,30 @@ def get_detailed_smart(drive_name):
     return status, hours, bad_sectors
 
 def log_data(result_data):
+    """Logs to CSV and generates a certificate for BOTH modes."""
     headers = ["Date", "Serial", "Model", "Capacity", "Hours", "Bad_Sectors", "SMART_Status", "Grade", "Wipe_Result", "Certificate_File"]
     with open(CSV_FILE, 'a', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=headers)
         writer.writerow(result_data)
     
-    if "SUCCESS" in result_data['Wipe_Result']:
-        cert_name = result_data['Certificate_File']
-        cert_path = os.path.join(CERT_DIR, cert_name)
-        with open(cert_path, 'w') as f:
-            f.write(f"--- DATA ERASURE & INTEGRITY CERTIFICATE ---\n")
-            f.write(f"Serial: {result_data['Serial']}\nModel: {result_data['Model']}\n")
-            f.write(f"Grade: {result_data['Grade']}\nDate: {result_data['Date']}\n")
-            f.write(f"Hours: {result_data['Hours']}\nBad Sectors: {result_data['Bad_Sectors']}\n")
-            f.write(f"Wipe Result: {result_data['Wipe_Result']}\n")
-            f.write(f"--- END OF REPORT ---")
+    cert_name = result_data['Certificate_File']
+    cert_path = os.path.join(CERT_DIR, cert_name)
+    with open(cert_path, 'w') as f:
+        f.write(f"--- HDD INSPECTION & INTEGRITY REPORT ---\n")
+        f.write(f"Report ID: {cert_name}\n")
+        f.write(f"Date:      {result_data['Date']}\n")
+        f.write(f"Model:     {result_data['Model']}\n")
+        f.write(f"Serial:    {result_data['Serial']}\n")
+        f.write(f"Capacity:  {result_data['Capacity']}\n")
+        f.write(f"-----------------------------------------\n")
+        f.write(f"Health:    {result_data['SMART_Status']}\n")
+        f.write(f"Hours:     {result_data['Hours']}\n")
+        f.write(f"Bad Sects: {result_data['Bad_Sectors']}\n")
+        f.write(f"Grade:     {result_data['Grade']}\n")
+        f.write(f"Wipe:      {result_data['Wipe_Result']}\n")
+        f.write(f"-----------------------------------------\n")
+        f.write(f"Certified by: HDD Prep Command Center v5.3\n")
+        f.write(f"--- END OF REPORT ---\n")
 
 def process_drive(drive_info, mode):
     drive_name = drive_info['name']
@@ -150,7 +158,7 @@ def process_drive(drive_info, mode):
         results_table.add_row(f"[bold white]{key}[/bold white]", str(value))
     
     console.print(Panel(results_table, expand=False))
-    console.print("\n[bold green]✔ LOGGED SUCCESSFULLY.[/bold green]")
+    console.print(f"\n[bold green]✔ DATA SAVED:[/bold green] {res['Certificate_File']}")
     
     if Confirm.ask("\n[bold yellow]Spin down drive for safe removal?[/bold yellow]"):
         subprocess.run(["sudo", "hdparm", "-Y", dev_path], capture_output=True)
@@ -162,11 +170,12 @@ def main():
     initialize_system()
     while True:
         console.clear()
-        console.print(Panel(Align.center("[bold cyan]HDD COMMAND CENTER v5.2[/bold cyan]\n[white]Select Mode: (1) Prep for Sale | (2) Verify Only[/white]"), border_style="cyan"))
+        console.print(Panel(Align.center("[bold cyan]HDD COMMAND CENTER v5.3[/bold cyan]"), border_style="cyan"))
         
+        # 1. Select Drive
         with Live(generate_inventory_table(), refresh_per_second=1):
             try:
-                choice = Prompt.ask("\nType [bold yellow]Device Name[/bold yellow] (sdb) or [bold red]'q'[/bold red]")
+                choice = Prompt.ask("\nType [bold yellow]Device Name[/bold yellow] (e.g. sdb) or [bold red]'q'[/bold red]")
                 if choice.lower() == 'q': exit()
             except KeyboardInterrupt: exit()
 
@@ -174,11 +183,18 @@ def main():
         selected = next((d for d in drives if d['name'] == choice), None)
         
         if selected:
-            mode = Prompt.ask(f"\n[bold white]Action for {selected['name']}[/bold white]", choices=["1", "2"], default="1")
-            if Confirm.ask(f"Confirm execution for {selected['serial']}?"):
+            # 2. Select Mode
+            console.print(f"\n[bold white]Drive Selected: {selected['name']} ({selected['serial']})[/bold white]")
+            console.print("[1] Full Prep for Sale (Wipe + Certify)")
+            console.print("[2] Verify Only (Quick Health Check)")
+            mode = Prompt.ask("\nSelect Mode", choices=["1", "2"], default="1")
+            
+            # 3. Final Confirmation
+            mode_label = "FULL PREP" if mode == "1" else "VERIFY ONLY"
+            if Confirm.ask(f"\n[bold cyan]Target: {selected['name']} | Mode: {mode_label}[/bold cyan]\nPress 'y' to begin or 'n' to cancel"):
                 process_drive(selected, mode)
         else:
-            console.print("[red]Invalid device.[/red]")
+            console.print("[red]Invalid device. Returning to menu...[/red]")
             time.sleep(1)
 
 if __name__ == "__main__":
