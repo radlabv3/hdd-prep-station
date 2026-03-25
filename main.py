@@ -18,32 +18,31 @@ console = Console()
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CSV_FILE = os.path.join(BASE_DIR, "hdd_inventory_log.csv")
 CERT_DIR = os.path.join(BASE_DIR, "certificates")
-OS_DRIVE = "sda"  # CRITICAL: Verify this is your OS drive via 'lsblk'
 
+# Automatically identify the OS drive to prevent accidental wiping
+def get_os_drive():
+    try:
+        cmd = "lsblk -no NAME,MOUNTPOINT | grep ' /$' | awk '{print $1}'"
+        os_partition = subprocess.check_output(cmd, shell=True, text=True).strip()
+        # Remove partition number (e.g., sda1 -> sda)
+        return re.sub(r'\d+$', '', os_partition)
+    except:
+        return "sda" # Fallback
+
+OS_DRIVE = get_os_drive()
 os.makedirs(CERT_DIR, exist_ok=True)
 
 def initialize_system():
-    """Checks for CSV existence and announces status to user."""
     headers = ["Date", "Serial", "Model", "Capacity", "Hours", "Bad_Sectors", "SMART_Status", "Grade", "Wipe_Result", "Certificate_File"]
-    
-    audit_panel = Panel(
-        Align.center("[bold yellow]SYSTEM AUDIT IN PROGRESS...[/bold yellow]"),
-        border_style="yellow"
-    )
-    console.print(audit_panel)
-    
-    if os.path.isfile(CSV_FILE):
-        console.print(f"[bold green]✔ FOUND:[/bold green] Inventory log at {CSV_FILE}")
-    else:
+    console.print(Panel(Align.center("[bold yellow]SYSTEM AUDIT IN PROGRESS...[/bold yellow]"), border_style="yellow"))
+    if not os.path.isfile(CSV_FILE):
         with open(CSV_FILE, 'w', newline='') as f:
             writer = csv.DictWriter(f, fieldnames=headers)
             writer.writeheader()
-        console.print(f"[bold cyan]★ CREATED:[/bold cyan] New inventory log initialized.")
-    
-    if os.path.isdir(CERT_DIR):
-        console.print(f"[bold green]✔ FOUND:[/bold green] Certificate directory active.")
-    
-    time.sleep(1.5)
+        console.print(f"[bold cyan]★ CREATED:[/bold cyan] New inventory log.")
+    else:
+        console.print(f"[bold green]✔ READY:[/bold green] Logging to {CSV_FILE}")
+    time.sleep(1)
 
 def get_drive_list():
     cmd = ["lsblk", "-dno", "NAME,SIZE,MODEL,SERIAL"]
@@ -61,7 +60,7 @@ def get_drive_list():
 
 def generate_inventory_table():
     drives = get_drive_list()
-    table = Table(title="[bold blue]Ready to Process[/bold blue]", border_style="blue")
+    table = Table(title="[bold blue]Detected Drives (Excluding OS)[/bold blue]", border_style="blue")
     table.add_column("Device", style="yellow")
     table.add_column("Model")
     table.add_column("Size")
@@ -71,131 +70,93 @@ def generate_inventory_table():
 
 def get_detailed_smart(drive_name):
     dev_path = f"/dev/{drive_name}"
-    subprocess.run(["sudo", "smartctl", "-t", "short", dev_path], capture_output=True)
-    attr_raw = subprocess.run(["sudo", "smartctl", "-A", dev_path], capture_output=True, text=True).stdout
+    # Using the confirmed '-d sat' flag for your working dock
+    attr_raw = subprocess.run(["sudo", "smartctl", "-d", "sat", "-A", dev_path], capture_output=True, text=True).stdout
+    
     hours, bad_sectors = 0, 0
-    h_match = re.search(r"Power_On_Hours\s+\S+\s+\S+\s+\S+\s+\S+\s+\S+\s+(\d+)", attr_raw)
-    if h_match: hours = int(h_match.group(1))
-    b_match = re.search(r"Reallocated_Sector_Ct\s+\S+\s+\S+\s+\S+\s+\S+\s+\S+\s+(\d+)", attr_raw)
-    if b_match: bad_sectors = int(b_match.group(1))
-    health_raw = subprocess.run(["sudo", "smartctl", "-H", dev_path], capture_output=True, text=True).stdout
+    for line in attr_raw.splitlines():
+        parts = line.split()
+        if len(parts) >= 10:
+            if parts[0] == "9" or "Power_On_Hours" in parts[1]:
+                try: hours = int(parts[-1])
+                except: pass
+            if parts[0] == "5" or "Reallocated_Sector_Ct" in parts[1]:
+                try: bad_sectors = int(parts[-1])
+                except: pass
+
+    health_raw = subprocess.run(["sudo", "smartctl", "-d", "sat", "-H", dev_path], capture_output=True, text=True).stdout
     status = "PASSED" if "test result: PASSED" in health_raw else "FAILED"
     return status, hours, bad_sectors
 
 def log_data(result_data):
-    """Logs to CSV and generates a certificate for BOTH modes."""
     headers = ["Date", "Serial", "Model", "Capacity", "Hours", "Bad_Sectors", "SMART_Status", "Grade", "Wipe_Result", "Certificate_File"]
     with open(CSV_FILE, 'a', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=headers)
         writer.writerow(result_data)
     
-    cert_name = result_data['Certificate_File']
-    cert_path = os.path.join(CERT_DIR, cert_name)
+    cert_path = os.path.join(CERT_DIR, result_data['Certificate_File'])
     with open(cert_path, 'w') as f:
-        f.write(f"--- HDD INSPECTION & INTEGRITY REPORT ---\n")
-        f.write(f"Report ID: {cert_name}\n")
-        f.write(f"Date:      {result_data['Date']}\n")
-        f.write(f"Model:     {result_data['Model']}\n")
-        f.write(f"Serial:    {result_data['Serial']}\n")
-        f.write(f"Capacity:  {result_data['Capacity']}\n")
-        f.write(f"-----------------------------------------\n")
-        f.write(f"Health:    {result_data['SMART_Status']}\n")
-        f.write(f"Hours:     {result_data['Hours']}\n")
-        f.write(f"Bad Sects: {result_data['Bad_Sectors']}\n")
-        f.write(f"Grade:     {result_data['Grade']}\n")
-        f.write(f"Wipe:      {result_data['Wipe_Result']}\n")
-        f.write(f"-----------------------------------------\n")
-        f.write(f"Certified by: HDD Prep Command Center v5.3\n")
-        f.write(f"--- END OF REPORT ---\n")
+        f.write(f"--- HDD PREP REPORT ---\nSerial: {result_data['Serial']}\nGrade:  {result_data['Grade']}\nHours:  {result_data['Hours']}\n---")
 
 def process_drive(drive_info, mode):
     drive_name = drive_info['name']
     serial = drive_info['serial']
-    dev_path = f"/dev/{drive_name}"
+    if serial == "UNKNOWN": serial = Prompt.ask("[bold yellow]Enter Serial[/bold yellow]")
 
-    if serial == "UNKNOWN" or serial == "":
-        console.print("[bold yellow]Identity Required:[/bold yellow] Device did not provide a Serial Number.")
-        serial = Prompt.ask("Please enter a Custom ID or Serial for this drive")
-
-    subprocess.run(["sudo", "umount", "-l", f"{dev_path}*"], capture_output=True)
+    subprocess.run(["sudo", "umount", "-l", f"/dev/{drive_name}*"], capture_output=True)
     
-    with console.status("[bold yellow]Running SMART Diagnostics...") as status_msg:
+    with console.status("[bold yellow]Scanning Health...") as status_msg:
         status, hours, pre_bad = get_detailed_smart(drive_name)
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
 
-    wipe_result = "N/A (Verify Only)"
-    
+    wipe_res = "N/A (Verify Only)"
     if mode == "1":
-        size_bytes = int(subprocess.check_output(["blockdev", "--getsize64", dev_path]))
-        with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), BarColumn(), "[progress.percentage]{task.percentage:>3.0f}%", DownloadColumn(), TransferSpeedColumn(), "ETA:", TimeRemainingColumn(), console=console) as progress:
+        size_bytes = int(subprocess.check_output(["blockdev", "--getsize64", f"/dev/{drive_name}"]))
+        with Progress(SpinnerColumn(), BarColumn(), "[progress.percentage]{task.percentage:>3.0f}%", DownloadColumn(), TransferSpeedColumn(), "ETA:", TimeRemainingColumn(), console=console) as progress:
             task = progress.add_task(f"[cyan]Wiping {serial}", total=size_bytes)
-            proc = subprocess.Popen(['sudo', 'dd', 'if=/dev/zero', f'of={dev_path}', 'bs=1M', 'status=none', 'conv=fdatasync'], stderr=subprocess.PIPE)
+            proc = subprocess.Popen(['sudo', 'dd', 'if=/dev/zero', f'of=/dev/{drive_name}', 'bs=1M', 'status=none', 'conv=fdatasync'], stderr=subprocess.PIPE)
             while proc.poll() is None:
                 if os.path.exists(f"/sys/block/{drive_name}/stat"):
                     with open(f"/sys/block/{drive_name}/stat", 'r') as f:
                         sectors_written = int(f.read().split()[6])
                         progress.update(task, completed=sectors_written * 512)
                 time.sleep(1)
-        wipe_result = "SUCCESS" if proc.returncode == 0 else "ERROR"
-        console.print("[bold magenta]Cooling & Verifying Integrity Check...[/bold magenta]")
-        time.sleep(5)
-    
-    final_status, final_hours, post_bad = get_detailed_smart(drive_name)
-    grade = "Grade A" if post_bad == 0 and final_hours < 20000 else "Grade B" if post_bad == 0 and final_hours < 50000 else "Grade C"
-    if post_bad > pre_bad: grade = "Grade C (Deteriorated)"
+        wipe_res = "SUCCESS" if proc.returncode == 0 else "ERROR"
 
+    f_status, f_hours, post_bad = get_detailed_smart(drive_name)
+    grade = "Grade A" if post_bad == 0 and f_hours < 20000 else "Grade B" if post_bad == 0 and f_hours < 50000 else "Grade C"
+    
     res = {
         "Date": timestamp, "Serial": serial, "Model": drive_info['model'], "Capacity": drive_info['size'],
-        "Hours": final_hours, "Bad_Sectors": post_bad, "SMART_Status": final_status,
-        "Grade": grade, "Wipe_Result": wipe_result, "Certificate_File": f"CERT_{serial}.txt"
+        "Hours": f_hours, "Bad_Sectors": post_bad, "SMART_Status": f_status,
+        "Grade": grade, "Wipe_Result": wipe_res, "Certificate_File": f"CERT_{serial}.txt"
     }
-    
     log_data(res)
 
     console.clear()
-    results_table = Table(title="[bold green]FINAL DRIVE REPORT[/bold green]", show_header=False, border_style="green")
-    for key, value in res.items():
-        results_table.add_row(f"[bold white]{key}[/bold white]", str(value))
+    table = Table(title="[bold green]FINAL DRIVE REPORT[/bold green]", show_header=False)
+    for k, v in res.items(): table.add_row(k, str(v))
+    console.print(Panel(table, expand=False))
     
-    console.print(Panel(results_table, expand=False))
-    console.print(f"\n[bold green]✔ DATA SAVED:[/bold green] {res['Certificate_File']}")
-    
-    if Confirm.ask("\n[bold yellow]Spin down drive for safe removal?[/bold yellow]"):
-        subprocess.run(["sudo", "hdparm", "-Y", dev_path], capture_output=True)
-        console.print(f"[bold green]Drive {drive_name} is now parked. You can unplug it.[/bold green]")
-        input("\nPress Enter to return to main menu...")
+    if Confirm.ask("\n[bold yellow]Spin down for safe removal?[/bold yellow]"):
+        subprocess.run(["sudo", "hdparm", "-Y", f"/dev/{drive_name}"], capture_output=True)
+        input("\n[bold green]Ready to unplug.[/bold green] Press Enter to continue...")
 
 def main():
-    console.clear()
     initialize_system()
     while True:
         console.clear()
-        console.print(Panel(Align.center("[bold cyan]HDD COMMAND CENTER v5.3[/bold cyan]"), border_style="cyan"))
-        
-        # 1. Select Drive
+        console.print(Panel(Align.center("[bold cyan]HDD COMMAND CENTER v5.6[/bold cyan]"), border_style="cyan"))
         with Live(generate_inventory_table(), refresh_per_second=1):
-            try:
-                choice = Prompt.ask("\nType [bold yellow]Device Name[/bold yellow] (e.g. sdb) or [bold red]'q'[/bold red]")
-                if choice.lower() == 'q': exit()
-            except KeyboardInterrupt: exit()
-
-        drives = get_drive_list()
-        selected = next((d for d in drives if d['name'] == choice), None)
+            choice = Prompt.ask("\nDevice (e.g. sdb) or 'q'")
+            if choice.lower() == 'q': break
         
-        if selected:
-            # 2. Select Mode
-            console.print(f"\n[bold white]Drive Selected: {selected['name']} ({selected['serial']})[/bold white]")
-            console.print("[1] Full Prep for Sale (Wipe + Certify)")
-            console.print("[2] Verify Only (Quick Health Check)")
-            mode = Prompt.ask("\nSelect Mode", choices=["1", "2"], default="1")
-            
-            # 3. Final Confirmation
-            mode_label = "FULL PREP" if mode == "1" else "VERIFY ONLY"
-            if Confirm.ask(f"\n[bold cyan]Target: {selected['name']} | Mode: {mode_label}[/bold cyan]\nPress 'y' to begin or 'n' to cancel"):
-                process_drive(selected, mode)
-        else:
-            console.print("[red]Invalid device. Returning to menu...[/red]")
-            time.sleep(1)
+        drives = get_drive_list()
+        sel = next((d for d in drives if d['name'] == choice), None)
+        if sel:
+            mode = Prompt.ask("\n[1] Full Prep | [2] Verify Only", choices=["1", "2"], default="1")
+            if Confirm.ask(f"Start {sel['name']}?"):
+                process_drive(sel, mode)
 
 if __name__ == "__main__":
     main()
