@@ -19,30 +19,29 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CSV_FILE = os.path.join(BASE_DIR, "hdd_inventory_log.csv")
 CERT_DIR = os.path.join(BASE_DIR, "certificates")
 
-# Automatically identify the OS drive to prevent accidental wiping
 def get_os_drive():
     try:
         cmd = "lsblk -no NAME,MOUNTPOINT | grep ' /$' | awk '{print $1}'"
         os_partition = subprocess.check_output(cmd, shell=True, text=True).strip()
-        # Remove partition number (e.g., sda1 -> sda)
         return re.sub(r'\d+$', '', os_partition)
     except:
-        return "sda" # Fallback
+        return "sda" 
 
 OS_DRIVE = get_os_drive()
 os.makedirs(CERT_DIR, exist_ok=True)
 
 def initialize_system():
-    headers = ["Date", "Serial", "Model", "Capacity", "Hours", "Bad_Sectors", "SMART_Status", "Grade", "Wipe_Result", "Certificate_File"]
+    # ADDED: Failure_Reason to headers
+    headers = ["Date", "Serial", "Model", "Capacity", "Hours", "Bad_Sectors", "SMART_Status", "Failure_Reason", "Grade", "Wipe_Result", "Certificate_File"]
     console.print(Panel(Align.center("[bold yellow]SYSTEM AUDIT IN PROGRESS...[/bold yellow]"), border_style="yellow"))
     if not os.path.isfile(CSV_FILE):
         with open(CSV_FILE, 'w', newline='') as f:
             writer = csv.DictWriter(f, fieldnames=headers)
             writer.writeheader()
-        console.print(f"[bold cyan]★ CREATED:[/bold cyan] New inventory log.")
+        console.print(f"[bold cyan]★ CREATED:[/bold cyan] New inventory log with Failure Tracking.")
     else:
         console.print(f"[bold green]✔ READY:[/bold green] Logging to {CSV_FILE}")
-    time.sleep(1)
+    time.sleep(1.5)
 
 def get_drive_list():
     cmd = ["lsblk", "-dno", "NAME,SIZE,MODEL,SERIAL"]
@@ -70,33 +69,59 @@ def generate_inventory_table():
 
 def get_detailed_smart(drive_name):
     dev_path = f"/dev/{drive_name}"
-    # Using the confirmed '-d sat' flag for your working dock
     attr_raw = subprocess.run(["sudo", "smartctl", "-d", "sat", "-A", dev_path], capture_output=True, text=True).stdout
     
     hours, bad_sectors = 0, 0
+    failing_attributes = []
+    
     for line in attr_raw.splitlines():
         parts = line.split()
         if len(parts) >= 10:
+            # Check for standard Hours and Bad Sectors
             if parts[0] == "9" or "Power_On_Hours" in parts[1]:
                 try: hours = int(parts[-1])
                 except: pass
             if parts[0] == "5" or "Reallocated_Sector_Ct" in parts[1]:
                 try: bad_sectors = int(parts[-1])
                 except: pass
+            
+            # THE SMART PARSER: Check if this specific attribute is failing right now
+            if "FAILING_NOW" in line:
+                failing_attributes.append(parts[1]) # Grabs the name of the broken component
 
     health_raw = subprocess.run(["sudo", "smartctl", "-d", "sat", "-H", dev_path], capture_output=True, text=True).stdout
     status = "PASSED" if "test result: PASSED" in health_raw else "FAILED"
-    return status, hours, bad_sectors
+    
+    # Formulate the Failure Reason
+    failure_reason = "N/A"
+    if status == "FAILED":
+        if failing_attributes:
+            failure_reason = f"CRITICAL: {', '.join(failing_attributes)}"
+        else:
+            # Sometimes a drive fails the health check but hides the specific attribute
+            failure_reason = "General Firmware/Hardware Fault"
+            
+    # Also flag high bad sectors even if the drive claims it "PASSED"
+    if bad_sectors > 0 and status == "PASSED":
+        failure_reason = f"WARNING: {bad_sectors} Bad Sectors Detected"
+
+    return status, hours, bad_sectors, failure_reason
 
 def log_data(result_data):
-    headers = ["Date", "Serial", "Model", "Capacity", "Hours", "Bad_Sectors", "SMART_Status", "Grade", "Wipe_Result", "Certificate_File"]
+    headers = ["Date", "Serial", "Model", "Capacity", "Hours", "Bad_Sectors", "SMART_Status", "Failure_Reason", "Grade", "Wipe_Result", "Certificate_File"]
     with open(CSV_FILE, 'a', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=headers)
         writer.writerow(result_data)
     
     cert_path = os.path.join(CERT_DIR, result_data['Certificate_File'])
     with open(cert_path, 'w') as f:
-        f.write(f"--- HDD PREP REPORT ---\nSerial: {result_data['Serial']}\nGrade:  {result_data['Grade']}\nHours:  {result_data['Hours']}\n---")
+        f.write(f"--- HDD PREP REPORT ---\n")
+        f.write(f"Serial: {result_data['Serial']}\n")
+        f.write(f"Grade:  {result_data['Grade']}\n")
+        f.write(f"Hours:  {result_data['Hours']}\n")
+        f.write(f"Health: {result_data['SMART_Status']}\n")
+        f.write(f"Reason: {result_data['Failure_Reason']}\n")
+        f.write(f"---")
 
 def process_drive(drive_info, mode):
     drive_name = drive_info['name']
@@ -106,7 +131,7 @@ def process_drive(drive_info, mode):
     subprocess.run(["sudo", "umount", "-l", f"/dev/{drive_name}*"], capture_output=True)
     
     with console.status("[bold yellow]Scanning Health...") as status_msg:
-        status, hours, pre_bad = get_detailed_smart(drive_name)
+        status, hours, pre_bad, pre_reason = get_detailed_smart(drive_name)
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
 
     wipe_res = "N/A (Verify Only)"
@@ -123,19 +148,34 @@ def process_drive(drive_info, mode):
                 time.sleep(1)
         wipe_res = "SUCCESS" if proc.returncode == 0 else "ERROR"
 
-    f_status, f_hours, post_bad = get_detailed_smart(drive_name)
-    grade = "Grade A" if post_bad == 0 and f_hours < 20000 else "Grade B" if post_bad == 0 and f_hours < 50000 else "Grade C"
+    f_status, f_hours, post_bad, f_reason = get_detailed_smart(drive_name)
     
+    # Adjust Grade based on FAILED status
+    if f_status == "FAILED" or post_bad > 0:
+        grade = "Grade C/F (FAILED)"
+    elif f_hours < 20000:
+        grade = "Grade A"
+    elif f_hours < 50000:
+        grade = "Grade B"
+    else:
+        grade = "Grade C"
+
     res = {
         "Date": timestamp, "Serial": serial, "Model": drive_info['model'], "Capacity": drive_info['size'],
-        "Hours": f_hours, "Bad_Sectors": post_bad, "SMART_Status": f_status,
+        "Hours": f_hours, "Bad_Sectors": post_bad, "SMART_Status": f_status, "Failure_Reason": f_reason,
         "Grade": grade, "Wipe_Result": wipe_res, "Certificate_File": f"CERT_{serial}.txt"
     }
     log_data(res)
 
     console.clear()
     table = Table(title="[bold green]FINAL DRIVE REPORT[/bold green]", show_header=False)
-    for k, v in res.items(): table.add_row(k, str(v))
+    for k, v in res.items(): 
+        # Highlight failures in red on the terminal screen
+        if k == "Failure_Reason" and v != "N/A":
+            table.add_row(f"[bold red]{k}[/bold red]", f"[bold red]{str(v)}[/bold red]")
+        else:
+            table.add_row(k, str(v))
+            
     console.print(Panel(table, expand=False))
     
     if Confirm.ask("\n[bold yellow]Spin down for safe removal?[/bold yellow]"):
@@ -146,7 +186,7 @@ def main():
     initialize_system()
     while True:
         console.clear()
-        console.print(Panel(Align.center("[bold cyan]HDD COMMAND CENTER v5.6[/bold cyan]"), border_style="cyan"))
+        console.print(Panel(Align.center("[bold cyan]HDD COMMAND CENTER v5.7[/bold cyan]"), border_style="cyan"))
         with Live(generate_inventory_table(), refresh_per_second=1):
             choice = Prompt.ask("\nDevice (e.g. sdb) or 'q'")
             if choice.lower() == 'q': break
